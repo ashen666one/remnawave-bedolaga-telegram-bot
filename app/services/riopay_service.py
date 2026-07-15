@@ -12,7 +12,7 @@ from app.config import settings
 
 logger = structlog.get_logger(__name__)
 
-API_BASE_URL = 'api.panel.valutix.kz'
+API_BASE_URL = 'https://api.panel.valutix.kz'
 
 
 class RioPayAPIError(Exception):
