@@ -684,6 +684,110 @@ class PlategaPayment(Base):
         return f'<PlategaPayment(id={self.id}, transaction_id={self.platega_transaction_id}, amount={self.amount_rubles}₽, status={self.status}, method={self.payment_method_code})>'
 
 
+class PlategaSubscription(Base):
+    __tablename__ = 'platega_subscriptions'
+
+    id = Column(Integer, primary_key=True, index=True)
+    user_id = Column(Integer, ForeignKey('users.id', ondelete='CASCADE'), nullable=False, index=True)
+    subscription_id = Column(Integer, ForeignKey('subscriptions.id', ondelete='CASCADE'), nullable=False, index=True)
+    tariff_id = Column(Integer, ForeignKey('tariffs.id'), nullable=True)
+
+    platega_subscription_id = Column(String(255), unique=True, nullable=True, index=True)
+    interval = Column(Integer, nullable=False)  # 1=day,2=week,3=month,4=year
+    charge_days = Column(Integer, nullable=False)  # шаг продления за одно списание
+    amount_kopeks = Column(Integer, nullable=False)
+    currency = Column(String(10), nullable=False, default='RUB')
+
+    status = Column(String(20), nullable=False, default='PENDING')  # PENDING/ACTIVE/PAST_DUE/CANCELLED/FAILED
+    redirect_url = Column(Text, nullable=True)
+    next_charge_at = Column(AwareDateTime(), nullable=True)
+    last_charge_at = Column(AwareDateTime(), nullable=True)
+    last_charge_external_id = Column(String(255), nullable=True)  # идемпотентность коллбека по charge Id
+    charges_success = Column(Integer, nullable=False, default=0)
+    charges_failed = Column(Integer, nullable=False, default=0)
+
+    created_at = Column(AwareDateTime(), default=func.now())
+    updated_at = Column(AwareDateTime(), default=func.now(), onupdate=func.now())
+
+    user = relationship('User', backref='platega_subscriptions')
+    subscription = relationship('Subscription', backref='platega_subscriptions')
+
+    __table_args__ = (
+        Index('ix_platega_subscriptions_user_active', 'user_id', 'status'),
+        # Одна живая привязка на подписку: гонка конкурентного enable проходит
+        # идемпотентную проверку ДО вставки — индекс делает вторую вставку
+        # IntegrityError, сервис возвращает существующую запись (миграция 0100).
+        Index(
+            'uq_platega_subscriptions_alive',
+            'subscription_id',
+            unique=True,
+            postgresql_where=text("status IN ('PENDING', 'ACTIVE', 'PAST_DUE')"),
+            sqlite_where=text("status IN ('PENDING', 'ACTIVE', 'PAST_DUE')"),
+        ),
+    )
+
+    @property
+    def amount_rubles(self) -> float:
+        return self.amount_kopeks / 100
+
+
+class LavaSubscription(Base):
+    """Рекуррентная подписка Lava, привязанная к подписке бота.
+
+    Аналог :class:`PlategaSubscription`. Отличие: сумма и периодичность заданы
+    ПРОДУКТОМ в кабинете Lava (``lava_product_id``), а не выводятся из тарифа —
+    ``charge_days`` копируется из продукта на момент оформления.
+    """
+
+    __tablename__ = 'lava_subscriptions'
+
+    id = Column(Integer, primary_key=True, index=True)
+    user_id = Column(Integer, ForeignKey('users.id', ondelete='CASCADE'), nullable=False, index=True)
+    subscription_id = Column(Integer, ForeignKey('subscriptions.id', ondelete='CASCADE'), nullable=False, index=True)
+    tariff_id = Column(Integer, ForeignKey('tariffs.id'), nullable=True)
+
+    lava_subscription_id = Column(String(255), unique=True, nullable=True, index=True)
+    lava_product_id = Column(String(255), nullable=False)
+    lava_consumer_id = Column(String(255), nullable=True)
+    # orderId подписки: по нему вебхук отличает списание по подписке от инвойса
+    order_id = Column(String(255), unique=True, nullable=False, index=True)
+
+    charge_days = Column(Integer, nullable=False)  # шаг продления за одно списание
+    amount_kopeks = Column(Integer, nullable=False)
+    currency = Column(String(10), nullable=False, default='RUB')
+
+    status = Column(String(20), nullable=False, default='PENDING')  # PENDING/ACTIVE/PAST_DUE/CANCELLED/FAILED
+    redirect_url = Column(Text, nullable=True)
+    next_charge_at = Column(AwareDateTime(), nullable=True)
+    last_charge_at = Column(AwareDateTime(), nullable=True)
+    last_charge_external_id = Column(String(255), nullable=True)  # идемпотентность коллбека по invoice_id
+    charges_success = Column(Integer, nullable=False, default=0)
+    charges_failed = Column(Integer, nullable=False, default=0)
+
+    created_at = Column(AwareDateTime(), default=func.now())
+    updated_at = Column(AwareDateTime(), default=func.now(), onupdate=func.now())
+
+    user = relationship('User', backref='lava_subscriptions')
+    subscription = relationship('Subscription', backref='lava_subscriptions')
+
+    __table_args__ = (
+        Index('ix_lava_subscriptions_user_active', 'user_id', 'status'),
+        # Одна живая привязка на подписку: проигравший гонку enable ловит
+        # IntegrityError и возвращает победителя (зеркало Platega).
+        Index(
+            'uq_lava_subscriptions_alive',
+            'subscription_id',
+            unique=True,
+            postgresql_where=text("status IN ('PENDING', 'ACTIVE', 'PAST_DUE')"),
+            sqlite_where=text("status IN ('PENDING', 'ACTIVE', 'PAST_DUE')"),
+        ),
+    )
+
+    @property
+    def amount_rubles(self) -> float:
+        return self.amount_kopeks / 100
+
+
 class CloudPaymentsPayment(Base):
     __tablename__ = 'cloudpayments_payments'
 
@@ -1778,6 +1882,10 @@ class Tariff(Base):
     is_daily = Column(Boolean, default=False, nullable=False)  # Является ли тариф суточным
     daily_price_kopeks = Column(Integer, default=0, nullable=False)  # Цена за день в копейках
 
+    # UUID продукта Lava для рекуррентных подписок: цена и периодичность списаний
+    # задаются в кабинете Lava, здесь только привязка тарифа к продукту.
+    lava_product_id = Column(String(255), nullable=True)
+
     # Произвольное количество дней
     custom_days_enabled = Column(Boolean, default=False, nullable=False)  # Разрешить произвольное кол-во дней
     price_per_day_kopeks = Column(Integer, default=0, nullable=False)  # Цена за 1 день в копейках
@@ -1976,6 +2084,9 @@ class User(Base):
     created_at = Column(AwareDateTime(), default=func.now())
     updated_at = Column(AwareDateTime(), default=func.now(), onupdate=func.now())
     last_activity = Column(AwareDateTime(), default=func.now())
+    # Панельный идентификатор пользователя (Remnawave 3.0.0: числовой id).
+    # remnawave_uuid оставлен как исторические данные, читается только одноразовым бэкфилом (восстановление идентичности).
+    remnawave_id = Column(BigInteger, nullable=True, unique=True, index=True)
     remnawave_uuid = Column(String(255), nullable=True, unique=True)
 
     # Cabinet authentication fields
@@ -2023,8 +2134,13 @@ class User(Base):
         for sub in self.subscriptions:
             if sub.status in (SubscriptionStatus.ACTIVE.value, SubscriptionStatus.TRIAL.value):
                 return sub
-        # Fallback to most recent (already ordered by created_at desc)
-        return self.subscriptions[0]
+        # Fallback to most recent real subscription (already ordered by created_at desc).
+        # Неоплаченные черновики триала пропускаем — иначе меню покажет незавершённую
+        # покупку триала как существующую подписку.
+        for sub in self.subscriptions:
+            if not sub.is_pending_trial:
+                return sub
+        return None
 
     def is_trial_already_used(self) -> bool:
         """Единый гейт доступности триала для бота И кабинета.
@@ -2037,9 +2153,7 @@ class User(Base):
         """
         if self.has_had_paid_subscription:
             return True
-        return any(
-            not (sub.status == SubscriptionStatus.PENDING.value and sub.is_trial) for sub in (self.subscriptions or [])
-        )
+        return any(not sub.is_pending_trial for sub in (self.subscriptions or []))
 
     transactions = relationship('Transaction', back_populates='user')
     referral_earnings = relationship('ReferralEarning', foreign_keys='ReferralEarning.user_id', back_populates='user')
@@ -2168,6 +2282,21 @@ class Subscription(Base):
             unique=True,
             postgresql_where=text("tariff_id IS NOT NULL AND status IN ('active', 'trial', 'limited')"),
         ),
+        # Панельная идентичность подписки. Уникальность частичная: непривязанных
+        # подписок (remnawave_id IS NULL) может быть сколько угодно, а вот две
+        # подписки на одного панельного пользователя — всегда ошибка. Код это и
+        # так предполагал (scalar_one_or_none в crud/user.py), но ничем не
+        # гарантировал; попутно снимает seq-scan с горячего webhook/grace-пути.
+        Index(
+            'uq_subscriptions_remnawave_id',
+            'remnawave_id',
+            unique=True,
+            postgresql_where=text('remnawave_id IS NOT NULL'),
+            sqlite_where=text('remnawave_id IS NOT NULL'),
+        ),
+        # shortUuid пережил 3.0.0 и остаётся единственным панельным ключом,
+        # которым можно резолвить строку, потерявшую связь.
+        Index('ix_subscriptions_remnawave_short_uuid', 'remnawave_short_uuid'),
     )
 
     id = Column(Integer, primary_key=True, index=True)
@@ -2215,6 +2344,10 @@ class Subscription(Base):
     grace_suppressed_until = Column(AwareDateTime(), nullable=True)
 
     remnawave_short_uuid = Column(String(255), nullable=True)
+    # Панельный идентификатор пользователя. С Remnawave 3.0.0 это числовой id —
+    # поле uuid из UsersSchema удалено. remnawave_uuid оставлен как исторические
+    # данные для аудита и разбора незарезолвленных строк; читается только одноразовым бэкфилом (восстановление идентичности).
+    remnawave_id = Column(BigInteger, nullable=True)
     remnawave_uuid = Column(String(255), nullable=True)
     remnawave_short_id = Column(
         String(16), nullable=False, unique=True, server_default=''
@@ -2247,6 +2380,17 @@ class Subscription(Base):
         current_time = datetime.now(UTC)
         end = _aware(self.end_date)
         return self.status == SubscriptionStatus.ACTIVE.value and end is not None and end > current_time
+
+    @property
+    def is_pending_trial(self) -> bool:
+        """Неоплаченный черновик триала (PENDING + is_trial).
+
+        Такой драфт создаётся при выборе способа оплаты платного триала и означает
+        «повторную попытку оплаты», а не реальную подписку. Он не считается
+        использованным триалом (см. User.is_trial_already_used) и не должен
+        отображаться в пользовательских меню как существующая подписка.
+        """
+        return self.status == SubscriptionStatus.PENDING.value and bool(self.is_trial)
 
     @property
     def is_expired(self) -> bool:
@@ -2464,7 +2608,13 @@ class GraceAccessSessionModel(Base):
 
     id = Column(String(36), primary_key=True)
     subscription_id = Column(Integer, ForeignKey('subscriptions.id', ondelete='CASCADE'), nullable=False)
-    remnawave_uuid = Column(String(255), nullable=False)
+    # Панельная идентичность сессии (Remnawave 3.0.0: числовой id). Nullable на
+    # время бэкфила: колонку нельзя добавить сразу NOT NULL на живой таблице, а
+    # флип делается отдельной ревизией после проверки нулей.
+    remnawave_id = Column(BigInteger, nullable=True, index=True)
+    # Ослаблено до nullable в 0104: панель 3.0.0 не отдаёт uuid, поэтому новые
+    # сессии его физически не могут заполнить. Историческое поле.
+    remnawave_uuid = Column(String(255), nullable=True)
     reason = Column(String(16), nullable=False)
     incident_key = Column(String(255), nullable=False)
     state = Column(String(16), nullable=False)
@@ -2593,6 +2743,9 @@ class PromoCode(Base):
 
     balance_bonus_kopeks = Column(Integer, default=0)
     subscription_days = Column(Integer, default=0)
+    # Гигабайты к подписке. Часть набора бонусов наравне с балансом и днями;
+    # 0 — трафик не начисляется.
+    traffic_gb = Column(Integer, default=0, server_default='0', nullable=False)
 
     max_uses = Column(Integer, default=1)
     current_uses = Column(Integer, default=0)
@@ -2666,6 +2819,10 @@ class CouponBatch(Base):
     period_days = Column(Integer, nullable=False)
     coupons_total = Column(Integer, nullable=False)
     wholesale_price_kopeks = Column(Integer, nullable=False, default=0)  # за купон; 0 — не указана
+    # Сколько купонов ЭТОЙ партии может активировать один пользователь.
+    # 0 — без ограничения (прежнее поведение); для раздач/конкурсов ставится 1,
+    # чтобы один человек не забрал всю партию.
+    max_per_user = Column(Integer, nullable=False, default=0)
     valid_until = Column(AwareDateTime(), nullable=True)
     # Display-only cache for list views; per-coupon Coupon.status is the
     # authority (redemption never consults this flag)
@@ -3012,6 +3169,29 @@ class PublicOffer(Base):
     is_enabled = Column(Boolean, default=True, nullable=False)
     created_at = Column(AwareDateTime(), default=func.now())
     updated_at = Column(AwareDateTime(), default=func.now(), onupdate=func.now())
+
+
+class LegalConsent(Base):
+    """Отметка «ознакомлен» с офертой/политикой, поставленная при регистрации.
+
+    Смысл чекбокса — в доказательстве, поэтому пишем журнал: кто, с каким документом,
+    когда и откуда согласился. Таблица append-only, уникальности нет намеренно: когда
+    появится переподтверждение после смены редакции документа, новая запись должна
+    лечь рядом со старой, а не затереть её.
+    """
+
+    __tablename__ = 'legal_consents'
+    __table_args__ = (Index('ix_legal_consents_user_document', 'user_id', 'document'),)
+
+    id = Column(Integer, primary_key=True, index=True)
+    user_id = Column(Integer, ForeignKey('users.id', ondelete='CASCADE'), nullable=False)
+    document = Column(String(32), nullable=False)
+    accepted_at = Column(AwareDateTime(), default=func.now(), nullable=False)
+    # Откуда поставлена галочка: cabinet_telegram / cabinet_email / …
+    source = Column(String(32), nullable=True)
+    ip_address = Column(String(64), nullable=True)
+
+    user = relationship('User')
 
 
 class RecurrentPayments(Base):
@@ -4352,6 +4532,10 @@ class GuestPurchase(Base):
     yandex_cid = Column(String(128), nullable=True)
     subid = Column(String(255), nullable=True)
     referrer = Column(String(500), nullable=True)
+    # Слаг рекламной кампании (``advertising_campaigns.start_parameter``).
+    # Оплату подтверждает вебхук платёжки, где куки и сессии покупателя уже
+    # нет, поэтому источник атрибуции хранится в самой покупке.
+    campaign_slug = Column(String(64), nullable=True)
 
     landing = relationship('LandingPage', back_populates='guest_purchases', lazy='selectin')
     tariff = relationship('Tariff', lazy='selectin')
